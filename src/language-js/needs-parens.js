@@ -230,6 +230,7 @@ function needsParens(path, options) {
         case "NewExpression":
           return name === "callee" && parent.callee === node;
 
+        case "ClassExpression":
         case "ClassDeclaration":
         case "TSAbstractClassDeclaration":
           return name === "superClass" && parent.superClass === node;
@@ -317,7 +318,8 @@ function needsParens(path, options) {
           parent.type === "TSTypeReference") &&
         (node.typeAnnotation.type === "TSTypeAnnotation" &&
           node.typeAnnotation.typeAnnotation.type !== "TSFunctionType" &&
-          grandParent.type !== "TSTypeOperator")
+          grandParent.type !== "TSTypeOperator" &&
+          grandParent.type !== "TSOptionalType")
       ) {
         return false;
       }
@@ -484,6 +486,8 @@ function needsParens(path, options) {
         grandParent.type === "ForStatement" &&
         (grandParent.init === parent || grandParent.update === parent)
       ) {
+        return false;
+      } else if (parent.type === "Property" && parent.value === node) {
         return false;
       }
       return true;

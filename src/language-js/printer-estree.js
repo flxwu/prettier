@@ -34,6 +34,7 @@ const clean = require("./clean");
 const insertPragma = require("./pragma").insertPragma;
 const handleComments = require("./comments");
 const pathNeedsParens = require("./needs-parens");
+const preprocess = require("./preprocess");
 
 const {
   builders: {
@@ -342,6 +343,8 @@ function printPathNoParens(path, options, print, args) {
 
   let parts = [];
   switch (n.type) {
+    case "JsonRoot":
+      return concat([path.call(print, "node"), hardline]);
     case "File":
       // Print @babel/parser's InterpreterDirective here so that
       // leading comments on the `Program` node get printed after the hashbang.
@@ -1954,16 +1957,19 @@ function printPathNoParens(path, options, print, args) {
         n.attributes.length && hasTrailingComment(getLast(n.attributes));
 
       const bracketSameLine =
-        options.jsxBracketSameLine &&
-        // We should print the bracket in a new line for the following cases:
-        // <div
-        //   // comment
-        // >
-        // <div
-        //   attr // comment
-        // >
-        (!nameHasComments || n.attributes.length) &&
-        !lastAttrHasTrailingComments;
+        // Simple tags (no attributes and no comment in tag name) should be
+        // kept unbroken regardless of `jsxBracketSameLine`
+        (!n.attributes.length && !nameHasComments) ||
+        (options.jsxBracketSameLine &&
+          // We should print the bracket in a new line for the following cases:
+          // <div
+          //   // comment
+          // >
+          // <div
+          //   attr // comment
+          // >
+          (!nameHasComments || n.attributes.length) &&
+          !lastAttrHasTrailingComments);
 
       // We should print the opening element expanded if any prop value is a
       // string literal with newlines
@@ -3426,6 +3432,28 @@ function shouldGroupFirstArg(args) {
   );
 }
 
+function isSimpleFlowType(node) {
+  const flowTypeAnnotations = [
+    "AnyTypeAnnotation",
+    "NullLiteralTypeAnnotation",
+    "GenericTypeAnnotation",
+    "ThisTypeAnnotation",
+    "NumberTypeAnnotation",
+    "VoidTypeAnnotation",
+    "EmptyTypeAnnotation",
+    "MixedTypeAnnotation",
+    "BooleanTypeAnnotation",
+    "BooleanLiteralTypeAnnotation",
+    "StringTypeAnnotation"
+  ];
+
+  return (
+    node &&
+    flowTypeAnnotations.indexOf(node.type) !== -1 &&
+    !(node.type === "GenericTypeAnnotation" && node.typeParameters)
+  );
+}
+
 const functionCompositionFunctionNames = new Set([
   "pipe", // RxJS, Ramda
   "pipeP", // Ramda
@@ -3715,20 +3743,6 @@ function printFunctionParams(path, print, options, expandArg, printTypeParams) {
     return concat([typeParams, "(", join(", ", printed), ")"]);
   }
 
-  const flowTypeAnnotations = [
-    "AnyTypeAnnotation",
-    "NullLiteralTypeAnnotation",
-    "GenericTypeAnnotation",
-    "ThisTypeAnnotation",
-    "NumberTypeAnnotation",
-    "VoidTypeAnnotation",
-    "EmptyTypeAnnotation",
-    "MixedTypeAnnotation",
-    "BooleanTypeAnnotation",
-    "BooleanLiteralTypeAnnotation",
-    "StringTypeAnnotation"
-  ];
-
   const isFlowShorthandWithOneArg =
     (isObjectTypePropertyAFunction(parent, options) ||
       isTypeAnnotationAFunction(parent, options) ||
@@ -3742,12 +3756,7 @@ function printFunctionParams(path, print, options, expandArg, printTypeParams) {
     fun[paramsField][0].name === null &&
     fun[paramsField][0].typeAnnotation &&
     fun.typeParameters === null &&
-    flowTypeAnnotations.indexOf(fun[paramsField][0].typeAnnotation.type) !==
-      -1 &&
-    !(
-      fun[paramsField][0].typeAnnotation.type === "GenericTypeAnnotation" &&
-      fun[paramsField][0].typeAnnotation.typeParameters
-    ) &&
+    isSimpleFlowType(fun[paramsField][0].typeAnnotation) &&
     !fun.rest;
 
   if (isFlowShorthandWithOneArg) {
@@ -4732,16 +4741,24 @@ function isJSXWhitespaceExpression(node) {
   );
 }
 
-function separatorNoWhitespace(isFacebookTranslationTag, child) {
+function separatorNoWhitespace(
+  isFacebookTranslationTag,
+  child,
+  childNode,
+  nextNode
+) {
   if (isFacebookTranslationTag) {
     return "";
   }
 
-  if (child.length === 1) {
-    return softline;
+  if (
+    (childNode.type === "JSXElement" && !childNode.closingElement) ||
+    (nextNode && (nextNode.type === "JSXElement" && !nextNode.closingElement))
+  ) {
+    return hardline;
   }
 
-  return hardline;
+  return softline;
 }
 
 function separatorWithWhitespace(isFacebookTranslationTag, child) {
@@ -4834,8 +4851,14 @@ function printJSXChildren(
             children.push(jsxWhitespace);
           }
         } else {
+          const next = n.children[i + 1];
           children.push(
-            separatorNoWhitespace(isFacebookTranslationTag, getLast(children))
+            separatorNoWhitespace(
+              isFacebookTranslationTag,
+              getLast(children),
+              child,
+              next
+            )
           );
         }
       } else if (/\n/.test(text)) {
@@ -4861,7 +4884,12 @@ function printJSXChildren(
           .trim()
           .split(matchJsxWhitespaceRegex)[0];
         children.push(
-          separatorNoWhitespace(isFacebookTranslationTag, firstWord)
+          separatorNoWhitespace(
+            isFacebookTranslationTag,
+            firstWord,
+            child,
+            next
+          )
         );
       } else {
         children.push(hardline);
@@ -4987,12 +5015,20 @@ function printJSXElement(path, options, print) {
       children[i] === jsxWhitespace &&
       children[i + 1] === "" &&
       children[i + 2] === jsxWhitespace;
+    const isPairOfHardOrSoftLines =
+      (children[i] === softline &&
+        children[i + 1] === "" &&
+        children[i + 2] === hardline) ||
+      (children[i] === hardline &&
+        children[i + 1] === "" &&
+        children[i + 2] === softline);
 
     if (
       (isPairOfHardlines && containsText) ||
       isPairOfEmptyStrings ||
       isLineFollowedByJSXWhitespace ||
-      isDoubleJSXWhitespace
+      isDoubleJSXWhitespace ||
+      isPairOfHardOrSoftLines
     ) {
       children.splice(i, 2);
     } else if (isJSXWhitespaceFollowedByLine) {
@@ -5100,11 +5136,12 @@ function maybeWrapJSXElementInParens(path, elem) {
     return elem;
   }
 
-  const shouldBreak = matchAncestorTypes(path, [
-    "ArrowFunctionExpression",
-    "CallExpression",
-    "JSXExpressionContainer"
-  ]);
+  const shouldBreak =
+    matchAncestorTypes(path, [
+      "ArrowFunctionExpression",
+      "CallExpression",
+      "JSXExpressionContainer"
+    ]) && isMemberExpressionChain(path.getParentNode(1).callee);
 
   return group(
     concat([
@@ -5492,6 +5529,13 @@ function classChildNeedsASIProtection(node) {
     return;
   }
 
+  if (
+    node.static ||
+    node.accessibility // TypeScript
+  ) {
+    return false;
+  }
+
   if (!node.computed) {
     const name = node.key && node.key.name;
     if (name === "in" || name === "instanceof") {
@@ -5508,12 +5552,7 @@ function classChildNeedsASIProtection(node) {
       // Babylon
       const isAsync = node.value ? node.value.async : node.async;
       const isGenerator = node.value ? node.value.generator : node.generator;
-      if (
-        isAsync ||
-        node.static ||
-        node.kind === "get" ||
-        node.kind === "set"
-      ) {
+      if (isAsync || node.kind === "get" || node.kind === "set") {
         return false;
       }
       if (node.computed || isGenerator) {
@@ -5618,7 +5657,7 @@ function isNodeStartingWithDeclare(node, options) {
 }
 
 function shouldHugType(node) {
-  if (isObjectType(node)) {
+  if (isSimpleFlowType(node) || isObjectType(node)) {
     return true;
   }
 
@@ -5773,17 +5812,18 @@ function isTestCall(n, parent) {
     }
 
     if (isUnitTestSetUp(n)) {
-      return (
-        isFunctionOrArrowExpression(n.arguments[0].type) ||
-        isAngularTestWrapper(n.arguments[0])
-      );
+      return isAngularTestWrapper(n.arguments[0]);
     }
-  } else if (n.arguments.length === 2) {
+  } else if (n.arguments.length === 2 || n.arguments.length === 3) {
     if (
       ((n.callee.type === "Identifier" && unitTestRe.test(n.callee.name)) ||
         isSkipOrOnlyBlock(n)) &&
       (isTemplateLiteral(n.arguments[0]) || isStringLiteral(n.arguments[0]))
     ) {
+      // it("name", () => { ... }, 2500)
+      if (n.arguments[2] && !isNumericLiteral(n.arguments[2])) {
+        return false;
+      }
       return (
         (isFunctionOrArrowExpression(n.arguments[1].type) &&
           n.arguments[1].params.length <= 1) ||
@@ -5955,6 +5995,7 @@ function rawText(node) {
 }
 
 module.exports = {
+  preprocess,
   print: genericPrint,
   embed,
   insertPragma,
